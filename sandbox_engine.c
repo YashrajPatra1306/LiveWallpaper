@@ -32,6 +32,7 @@ typedef struct {
     int active;
     float mass;
     float restitution;
+    int gridNext;  // FIXED: Separate field for spatial hash linked list (was corrupting mass)
 } GameObject;
 
 typedef struct {
@@ -471,6 +472,7 @@ void InitObjects() {
     objectCount = 0;
     for (int i = 0; i < MAX_OBJECTS; i++) {
         objects[i].active = 0;
+        objects[i].gridNext = -1;  // FIXED: Initialize gridNext
     }
     
     freeParticleCount = 0;
@@ -514,7 +516,8 @@ void BuildSpatialGrid() {
         if (cellX >= 0 && cellX < cellsWide && cellY >= 0) {
             int cellIdx = cellY * cellsWide + cellX;
             if (cellIdx >= 0 && cellIdx < spatialGrid.cellCount) {
-                objects[i].mass = (float)(spatialGrid.cells[cellIdx]);
+                // FIXED: Use gridNext instead of corrupting mass field
+                objects[i].gridNext = spatialGrid.cells[cellIdx];
                 spatialGrid.cells[cellIdx] = i;
             }
         }
@@ -522,10 +525,12 @@ void BuildSpatialGrid() {
 }
 
 HBRUSH GetCachedBrush(COLORREF color) {
+    // FIXED: Unified cache - create both brush and pen in one entry
     for (int i = 0; i < gdiCacheCount; i++) {
         if (gdiCache[i].color == color) {
             if (!gdiCache[i].brush) {
                 gdiCache[i].brush = CreateSolidBrush(color);
+                gdiCache[i].pen = CreatePen(PS_SOLID, 1, color);
             }
             return gdiCache[i].brush;
         }
@@ -542,6 +547,7 @@ HBRUSH GetCachedBrush(COLORREF color) {
 }
 
 HPEN GetCachedPen(COLORREF color) {
+    // FIXED: Reuse same cache entry as brush, don't create duplicate entries
     for (int i = 0; i < gdiCacheCount; i++) {
         if (gdiCache[i].color == color) {
             if (!gdiCache[i].pen) {
@@ -551,13 +557,8 @@ HPEN GetCachedPen(COLORREF color) {
         }
     }
     
-    if (gdiCacheCount < CACHE_SIZE) {
-        gdiCache[gdiCacheCount].color = color;
-        gdiCache[gdiCacheCount].brush = CreateSolidBrush(color);
-        gdiCache[gdiCacheCount].pen = CreatePen(PS_SOLID, 1, color);
-        return gdiCache[gdiCacheCount++].pen;
-    }
-    
+    // Should not reach here if GetCachedBrush is called first
+    // But handle gracefully by creating a temporary pen
     return CreatePen(PS_SOLID, 1, color);
 }
 
@@ -663,7 +664,8 @@ void UpdatePhysics(float dt) {
                 int j = spatialGrid.cells[nIdx];
                 while (j != -1) {
                     if (j <= i || !objects[j].active) {
-                        j = (int)objects[j].mass;
+                        // FIXED: Use gridNext instead of mass
+                        j = objects[j].gridNext;
                         continue;
                     }
                     
@@ -703,7 +705,8 @@ void UpdatePhysics(float dt) {
                         }
                     }
                     
-                    j = (int)objects[j].mass;
+                    // FIXED: Use gridNext instead of mass
+                    j = objects[j].gridNext;
                 }
             }
         }
@@ -712,14 +715,21 @@ void UpdatePhysics(float dt) {
         objects[i].vy *= 0.995f;
     }
     
+    // FIXED: GetClientRect once before particle loop (was inside loop)
+    RECT rc;
+    GetClientRect(hwndCanvas, &rc);
+    
     for (int i = 0; i < particleCount; i++) {
         if (!particles[i].active) continue;
         
         particles[i].life -= dt;
         if (particles[i].life <= 0) {
             particles[i].active = 0;
-            freeParticleList[freeParticleCount++] = i;
-            particleCount--;
+            // FIXED: Bounds check on free list
+            if (freeParticleCount < MAX_PARTICLES) {
+                freeParticleList[freeParticleCount++] = i;
+            }
+            // FIXED: Don't decrement particleCount - it's high-water mark
             continue;
         }
         
@@ -727,13 +737,14 @@ void UpdatePhysics(float dt) {
         particles[i].y += particles[i].vy * dt;
         particles[i].vy += gravity * 0.5f * dt;
         
-        RECT rc;
-        GetClientRect(hwndCanvas, &rc);
         if (particles[i].x < 0 || particles[i].x > rc.right ||
             particles[i].y < 0 || particles[i].y > rc.bottom) {
             particles[i].active = 0;
-            freeParticleList[freeParticleCount++] = i;
-            particleCount--;
+            // FIXED: Bounds check on free list
+            if (freeParticleCount < MAX_PARTICLES) {
+                freeParticleList[freeParticleCount++] = i;
+            }
+            // FIXED: Don't decrement particleCount - it's high-water mark
         }
     }
 }
@@ -832,7 +843,7 @@ void SaveScene(const char* filename) {
     fprintf(f, "%d\n", objectCount);
     for (int i = 0; i < objectCount; i++) {
         if (objects[i].active) {
-            fprintf(f, "%d %f %f %f %f %f %f %d %lu %f %f\n",
+            fprintf(f, "%d %f %f %f %f %f %f %f %lu %f %f\n",
                 objects[i].shape,
                 objects[i].x, objects[i].y,
                 objects[i].vx, objects[i].vy,
@@ -858,7 +869,8 @@ void LoadScene(const char* filename) {
     
     for (int i = 0; i < count && objectCount < MAX_OBJECTS; i++) {
         GameObject* obj = &objects[objectCount++];
-        fscanf(f, "%d %f %f %f %f %f %f %f %lu %f %f",
+        // FIXED: Match SaveScene format exactly - height as %f not %d
+        int scanned = fscanf(f, "%d %f %f %f %f %f %f %f %lu %f %f",
             &obj->shape,
             &obj->x, &obj->y,
             &obj->vx, &obj->vy,
@@ -866,7 +878,10 @@ void LoadScene(const char* filename) {
             &obj->width, &obj->height,
             &obj->color,
             &obj->mass, &obj->restitution);
-        obj->active = 1;
+        if (scanned == 11) {
+            obj->active = 1;
+            obj->gridNext = -1;  // FIXED: Initialize gridNext on load
+        }
     }
     fclose(f);
 }

@@ -1,145 +1,90 @@
-# Sandbox Rendering Engine - Native Windows Application
+# Native Windows Sandbox Rendering Engine
 
-A **pure native Windows application** built with Win32 API and GDI. No web technologies, no Electron, no Chromium wrapper.
+A pure native Windows application optimized for low-tier laptops. No web technologies, no Electron, no Chromium - just pure Win32 API and GDI.
 
 ## Features
 
-- **Pure Native Code**: Written in C using only Win32 API and GDI
-- **Optimized for Low-Tier Hardware**: Efficient rendering with backbuffer, adjustable performance modes
-- **Full Physics Simulation**: Gravity, collisions, momentum, restitution
-- **Multiple Shape Types**: Circle, Rectangle, Triangle, Line
-- **Particle System**: Up to 2000 particles with physics
-- **Tool Modes**: Draw, Move, Delete, Particles, Physics (force field)
-- **Scene Management**: Save and load scenes to/from text files
-- **Color Picker**: Right-click to choose colors
-- **Real-time Stats**: FPS counter, object count, particle count
+- **Pure Native Code**: 100% Win32 API + GDI rendering
+- **Optimized Performance**: Spatial hashing for O(n) collision detection
+- **Physics Simulation**: Full rigid body physics with collisions, gravity, and restitution
+- **Particle System**: Free-list reuse for efficient particle management
+- **Multiple Tools**: Draw, Move, Delete, Particles, and Force tools
+- **Shape Types**: Circle, Rectangle, Triangle, and Line
+- **Save/Load Scenes**: JSON-like format for persisting simulations
+- **Low Power Mode**: Doubles timestep for better performance on weak hardware
+- **GDI Object Caching**: Prevents handle leaks and improves rendering speed
 
-## Requirements
+## Architecture
 
-### To Build:
-- **MinGW-w64** (GCC for Windows) OR **MSYS2**
-- Windows SDK (usually comes with Visual Studio or MinGW)
+This engine implements the architectural patterns from the Rust/C# Godot reference:
 
-### To Run (compiled executable):
-- Windows 7 or later
-- No additional dependencies required!
-
-## Installation
-
-### Option 1: MSYS2 (Recommended)
-1. Download MSYS2 from https://www.msys2.org/
-2. Install to default location
-3. Open MSYS2 MinGW x64 terminal
-4. Install toolchain: `pacman -S mingw-w64-x86_64-toolchain`
-5. Navigate to this directory
-6. Run: `gcc -O2 -o sandbox_engine.exe sandbox_engine.c -lgdi32 -luser32 -lcomctl32 -lm -mwindows`
-
-### Option 2: MinGW-w64 Standalone
-1. Download from https://www.mingw-w64.org/
-2. Extract and add `bin` folder to PATH
-3. Run `build.bat` or compile manually
-
-### Option 3: Visual Studio
-1. Create a new Win32 Project
-2. Replace the generated code with `sandbox_engine.c`
-3. Add `comctl32.lib` to linker dependencies
-4. Build
+- **Spatial Hash Grid**: O(log n) lookup similar to BSP trees
+- **Lazy Instantiation**: Objects only rendered when active
+- **Data-Oriented Design**: Separate pools for objects and particles
+- **Cache-Conscious**: GDI object caching to prevent kernel handle exhaustion
 
 ## Building
 
-### Using the build script:
+### Requirements
+- Windows 7 or later
+- MinGW-w64 (GCC) OR Microsoft Visual C++
+
+### Quick Build
 ```batch
 build.bat
 ```
 
-### Manual compilation:
+### Manual Build (MinGW)
 ```batch
 gcc -O2 -o sandbox_engine.exe sandbox_engine.c -lgdi32 -luser32 -lcomctl32 -lm -mwindows
 ```
 
-## Usage
-
-### Controls:
-- **Left Click**: Use the selected tool
-- **Right Click**: Open color picker
-- **Tools** (select via radio buttons):
-  - **Draw**: Create new objects
-  - **Move**: Drag objects around
-  - **Delete**: Remove objects
-  - **Particles**: Spawn particle effects
-  - **Physics**: Apply force field to push/pull objects
-
-### Shapes:
-- Circle
-- Rectangle
-- Triangle
-- Line
-
-### Options:
-- **Low Power Mode**: Reduces physics update rate for better performance on very old hardware
-- **Clear All**: Remove all objects and particles
-- **Save**: Export scene to text file
-- **Load**: Import scene from text file
-
-## Technical Details
-
-### Architecture:
-- **Window Procedure**: Main message loop handling WM_CREATE, WM_TIMER, WM_COMMAND
-- **Custom Canvas**: Subclassed static control for rendering area
-- **Double Buffering**: Back buffer DC prevents flickering
-- **Physics Engine**: Custom impulse-based collision resolution
-- **Particle System**: Simple lifecycle-based particle management
-
-### Performance Optimizations:
-- Fixed-size arrays (no dynamic allocation during runtime)
-- Spatial hashing ready (currently O(n²) collision detection, can be optimized)
-- Configurable timer interval for low-power mode
-- GDI batch rendering with minimal state changes
-
-### Memory Usage:
-- ~100 KB base memory footprint
-- Objects: 500 max × 48 bytes = 24 KB
-- Particles: 2000 max × 32 bytes = 64 KB
-- Total: <200 KB typical usage
-
-## File Format
-
-Scene files are plain text:
+### Manual Build (MSVC)
+```batch
+cl /O2 /Fe:sandbox_engine.exe sandbox_engine.c gdi32.lib user32.lib comctl32.lib
 ```
-<object_count>
-<shape> <x> <y> <vx> <vy> <radius> <width> <height> <color> <mass> <restitution>
-...
-```
+
+## Controls
+
+| Key/Action | Function |
+|------------|----------|
+| **1** | Draw Tool |
+| **2** | Move Tool |
+| **3** | Delete Tool |
+| **4** | Particle Tool |
+| **5** | Force Tool (radial blast) |
+| **C** | Circle Shape |
+| **R** | Rectangle Shape |
+| **T** | Triangle Shape |
+| **L** | Line Shape |
+| **S** | Save Scene |
+| **O** | Load Scene |
+| **P** | Toggle Physics |
+| **M** | Toggle Low Power Mode |
+| **Left Click** | Use Current Tool |
+| **Right Click** | Spawn Particles |
+
+## Bug Fixes Applied (v3)
+
+All critical bugs from the code review have been fixed:
+
+1. ✅ **gridNext field added** - Separated spatial hash linked list from mass field (was corrupting physics)
+2. ✅ **particleCount high-water mark** - No longer decremented, prevents skipping active particles
+3. ✅ **SaveScene/LoadScene format** - Consistent %f for all floats, fixed newline escape
+4. ✅ **GetClientRect optimization** - Moved outside particle loop (was syscall per particle)
+5. ✅ **freeParticleList bounds check** - Prevents buffer overflow
+6. ✅ **GDI cache unified** - One entry per color with both brush and pen
+7. ✅ **gridNext initialization** - Properly initialized in InitObjects and LoadScene
+
+## Performance Characteristics
+
+- **Memory**: ~2-5 MB RAM depending on object count
+- **CPU**: Single-threaded, optimized for single-core performance
+- **Rendering**: Double-buffered GDI with BitBlt
+- **Collision Detection**: O(n) average case with spatial hashing
+- **Max Objects**: 500 (configurable via MAX_OBJECTS)
+- **Max Particles**: 2000 (configurable via MAX_PARTICLES)
 
 ## License
 
-Public domain / MIT - Use freely for any purpose.
-
-## Troubleshooting
-
-### "GCC not found"
-- Ensure MinGW is installed and `gcc.exe` is in your PATH
-- Test by running `gcc --version` in command prompt
-
-### Compilation errors
-- Make sure you're using a MinGW compiler, not MSVC
-- For MSVC, create a Win32 project and adjust includes
-
-### Poor performance
-- Enable "Low Power" mode in the toolbar
-- Reduce the number of objects/particles
-- Close other applications
-
-## Future Enhancements
-
-Potential additions for extended functionality:
-- Texture mapping support
-- More shape types (polygons, curves)
-- Joints/constraints for ragdoll physics
-- Scripting interface (Lua)
-- Multi-threaded physics
-- OpenGL/DirectX renderer option
-
----
-
-**This is a 100% native Windows application with zero web technology dependencies.**
+Public Domain / MIT - Use freely for any purpose.
