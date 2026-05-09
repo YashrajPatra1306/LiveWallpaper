@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <stdio.h>
@@ -15,8 +16,10 @@
 #define MAX_PARTICLES 2000
 #define TIMER_ID 1
 #define TIMER_INTERVAL 16
+#define CACHE_SIZE 256
+#define GRID_CELL_SIZE 100
 
-typedef enum { TOOL_DRAW, TOOL_MOVE, TOOL_DELETE, TOOL_PARTICLES, TOOL_PHYSICS } ToolMode;
+typedef enum { TOOL_DRAW, TOOL_MOVE, TOOL_DELETE, TOOL_PARTICLES, TOOL_FORCE } ToolMode;
 typedef enum { SHAPE_CIRCLE, SHAPE_RECT, SHAPE_TRIANGLE, SHAPE_LINE } ShapeType;
 
 typedef struct {
@@ -40,30 +43,54 @@ typedef struct {
     int active;
 } Particle;
 
+typedef struct {
+    COLORREF color;
+    HBRUSH brush;
+    HPEN pen;
+} GdiCacheEntry;
+
+typedef struct {
+    int* cells;
+    int cellCount;
+    int width, height;
+} SpatialGrid;
+
 static GameObject objects[MAX_OBJECTS];
 static Particle particles[MAX_PARTICLES];
+static int freeParticleList[MAX_PARTICLES];
+static int freeParticleCount = 0;
 static int objectCount = 0;
 static int particleCount = 0;
 static ToolMode currentTool = TOOL_DRAW;
 static ShapeType currentShape = SHAPE_CIRCLE;
-static COLORREFcurrentColor = RGB(100, 150, 255);
+static COLORREF currentColor = RGB(100, 150, 255);
 static float currentSize = 30.0f;
 static float gravity = 500.0f;
 static int showPhysics = 1;
 static int lowPowerMode = 0;
 static HWND hwndCanvas;
-static HDC hdcBackBuffer;
-static HBITMAP hbmBackBuffer;
+static HDC hdcBackBuffer = NULL;
+static HBITMAP hbmBackBuffer = NULL;
 static int isDragging = 0;
 static int dragIndex = -1;
 static float dragOffsetX, dragOffsetY;
 static float fps = 0.0f;
 static int frameCount = 0;
 static DWORD lastFpsTime = 0;
+static DWORD fpsFrameTimes[30];
+static int fpsFrameIndex = 0;
+static GdiCacheEntry gdiCache[CACHE_SIZE];
+static int gdiCacheCount = 0;
+static SpatialGrid spatialGrid = {0};
 
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK CanvasProc(HWND, UINT, WPARAM, LPARAM);
 void InitObjects();
+void InitSpatialGrid(int width, int height);
+void BuildSpatialGrid();
+HBRUSH GetCachedBrush(COLORREF color);
+HPEN GetCachedPen(COLORREF color);
+void CleanupGdiCache();
 void UpdatePhysics(float dt);
 void Render(HDC hdc);
 void SpawnParticles(float x, float y, int count);
@@ -71,6 +98,7 @@ int PickObject(float x, float y);
 void SaveScene(const char* filename);
 void LoadScene(const char* filename);
 void ShowAboutDialog(HWND hwnd);
+float CalculateFps();
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     WNDCLASSEX wc = {0};
@@ -144,7 +172,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 10, 60, 80, 25, hwndToolbar, (HMENU)103, NULL, NULL);
             CreateWindow("BUTTON", "Particles", BS_RADIOBUTTON | WS_CHILD | WS_VISIBLE,
                 95, 60, 80, 25, hwndToolbar, (HMENU)104, NULL, NULL);
-            CreateWindow("BUTTON", "Physics", BS_RADIOBUTTON | WS_CHILD | WS_VISIBLE,
+            CreateWindow("BUTTON", "Force", BS_RADIOBUTTON | WS_CHILD | WS_VISIBLE,
                 10, 90, 165, 25, hwndToolbar, (HMENU)105, NULL, NULL);
             
             CreateWindow("STATIC", "Shape:", WS_CHILD | WS_VISIBLE,
@@ -201,10 +229,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (wParam == TIMER_ID) {
                 frameCount++;
                 DWORD now = GetTickCount();
-                if (now - lastFpsTime >= 1000) {
-                    fps = (float)frameCount * 1000.0f / (now - lastFpsTime);
+                
+                fpsFrameTimes[fpsFrameIndex] = now;
+                fpsFrameIndex = (fpsFrameIndex + 1) % 30;
+                
+                if (frameCount >= 30 && fpsFrameIndex != 0) {
+                    DWORD oldest = fpsFrameTimes[fpsFrameIndex];
+                    DWORD newest = fpsFrameTimes[(fpsFrameIndex + 29) % 30];
+                    if (newest > oldest) {
+                        fps = 30.0f * 1000.0f / (float)(newest - oldest);
+                    }
+                } else if (now - lastFpsTime >= 500) {
+                    fps = (float)frameCount * 1000.0f / (now - lastFpsTime + 1);
                     frameCount = 0;
                     lastFpsTime = now;
+                    fpsFrameIndex = 0;
                 }
                 
                 float dt = 0.016f;
@@ -219,7 +258,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     currentTool == TOOL_DRAW ? "Draw" :
                     currentTool == TOOL_MOVE ? "Move" :
                     currentTool == TOOL_DELETE ? "Delete" :
-                    currentTool == TOOL_PARTICLES ? "Particles" : "Physics");
+                    currentTool == TOOL_PARTICLES ? "Particles" : "Force");
                 SetWindowText(hwndStatus, status);
             }
             return 0;
@@ -277,6 +316,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 DeleteDC(hdcBackBuffer);
                 DeleteObject(hbmBackBuffer);
             }
+            CleanupGdiCache();
             PostQuitMessage(0);
             return 0;
     }
@@ -292,16 +332,11 @@ LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     RECT rc;
     
     switch (msg) {
-        case WM_PAINT:
+        case WM_PAINT: {
             hdc = BeginPaint(hwnd, &ps);
-            
             GetClientRect(hwnd, &rc);
             
-            if (!hdcBackBuffer || rc.right != 0) {
-                if (hdcBackBuffer) {
-                    DeleteDC(hdcBackBuffer);
-                    DeleteObject(hbmBackBuffer);
-                }
+            if (!hdcBackBuffer) {
                 hdcBackBuffer = CreateCompatibleDC(hdc);
                 hbmBackBuffer = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
                 SelectObject(hdcBackBuffer, hbmBackBuffer);
@@ -315,6 +350,19 @@ LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             BitBlt(hdc, 0, 0, rc.right, rc.bottom, hdcBackBuffer, 0, 0, SRCCOPY);
             EndPaint(hwnd, &ps);
             return 0;
+        }
+        
+        case WM_SIZE: {
+            GetClientRect(hwnd, &rc);
+            if (hdcBackBuffer) {
+                DeleteDC(hdcBackBuffer);
+                DeleteObject(hbmBackBuffer);
+                hdcBackBuffer = NULL;
+                hbmBackBuffer = NULL;
+            }
+            InitSpatialGrid(rc.right, rc.bottom);
+            return 0;
+        }
         
         case WM_LBUTTONDOWN:
         case WM_LBUTTONUP:
@@ -371,7 +419,7 @@ LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                 } else if (currentTool == TOOL_PARTICLES) {
                     SpawnParticles(x, y, 10);
-                } else if (currentTool == TOOL_PHYSICS) {
+                } else if (currentTool == TOOL_FORCE) {
                     for (int i = 0; i < objectCount; i++) {
                         if (objects[i].active) {
                             float dx = objects[i].x - x;
@@ -424,10 +472,125 @@ void InitObjects() {
     for (int i = 0; i < MAX_OBJECTS; i++) {
         objects[i].active = 0;
     }
+    
+    freeParticleCount = 0;
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        particles[i].active = 0;
+        freeParticleList[freeParticleCount++] = i;
+    }
+    particleCount = 0;
+}
+
+void InitSpatialGrid(int width, int height) {
+    spatialGrid.width = width;
+    spatialGrid.height = height;
+    spatialGrid.cellCount = ((width + GRID_CELL_SIZE - 1) / GRID_CELL_SIZE) * 
+                            ((height + GRID_CELL_SIZE - 1) / GRID_CELL_SIZE);
+    
+    if (spatialGrid.cells) {
+        free(spatialGrid.cells);
+    }
+    spatialGrid.cells = (int*)calloc(spatialGrid.cellCount, sizeof(int));
+    for (int i = 0; i < spatialGrid.cellCount; i++) {
+        spatialGrid.cells[i] = -1;
+    }
+}
+
+void BuildSpatialGrid() {
+    if (!spatialGrid.cells || spatialGrid.width <= 0 || spatialGrid.height <= 0) return;
+    
+    for (int i = 0; i < spatialGrid.cellCount; i++) {
+        spatialGrid.cells[i] = -1;
+    }
+    
+    int cellsWide = (spatialGrid.width + GRID_CELL_SIZE - 1) / GRID_CELL_SIZE;
+    
+    for (int i = 0; i < objectCount; i++) {
+        if (!objects[i].active) continue;
+        
+        int cellX = (int)(objects[i].x / GRID_CELL_SIZE);
+        int cellY = (int)(objects[i].y / GRID_CELL_SIZE);
+        
+        if (cellX >= 0 && cellX < cellsWide && cellY >= 0) {
+            int cellIdx = cellY * cellsWide + cellX;
+            if (cellIdx >= 0 && cellIdx < spatialGrid.cellCount) {
+                objects[i].mass = (float)(spatialGrid.cells[cellIdx]);
+                spatialGrid.cells[cellIdx] = i;
+            }
+        }
+    }
+}
+
+HBRUSH GetCachedBrush(COLORREF color) {
+    for (int i = 0; i < gdiCacheCount; i++) {
+        if (gdiCache[i].color == color) {
+            if (!gdiCache[i].brush) {
+                gdiCache[i].brush = CreateSolidBrush(color);
+            }
+            return gdiCache[i].brush;
+        }
+    }
+    
+    if (gdiCacheCount < CACHE_SIZE) {
+        gdiCache[gdiCacheCount].color = color;
+        gdiCache[gdiCacheCount].brush = CreateSolidBrush(color);
+        gdiCache[gdiCacheCount].pen = CreatePen(PS_SOLID, 1, color);
+        return gdiCache[gdiCacheCount++].brush;
+    }
+    
+    return CreateSolidBrush(color);
+}
+
+HPEN GetCachedPen(COLORREF color) {
+    for (int i = 0; i < gdiCacheCount; i++) {
+        if (gdiCache[i].color == color) {
+            if (!gdiCache[i].pen) {
+                gdiCache[i].pen = CreatePen(PS_SOLID, 1, color);
+            }
+            return gdiCache[i].pen;
+        }
+    }
+    
+    if (gdiCacheCount < CACHE_SIZE) {
+        gdiCache[gdiCacheCount].color = color;
+        gdiCache[gdiCacheCount].brush = CreateSolidBrush(color);
+        gdiCache[gdiCacheCount].pen = CreatePen(PS_SOLID, 1, color);
+        return gdiCache[gdiCacheCount++].pen;
+    }
+    
+    return CreatePen(PS_SOLID, 1, color);
+}
+
+void CleanupGdiCache() {
+    for (int i = 0; i < gdiCacheCount; i++) {
+        if (gdiCache[i].brush) DeleteObject(gdiCache[i].brush);
+        if (gdiCache[i].pen) DeleteObject(gdiCache[i].pen);
+    }
+    gdiCacheCount = 0;
+}
+
+float CalculateFps() {
+    DWORD now = GetTickCount();
+    fpsFrameTimes[fpsFrameIndex] = now;
+    fpsFrameIndex = (fpsFrameIndex + 1) % 30;
+    
+    if (frameCount >= 30) {
+        DWORD oldest = fpsFrameTimes[0];
+        DWORD newest = fpsFrameTimes[29];
+        if (newest > oldest) {
+            return 30.0f * 1000.0f / (float)(newest - oldest);
+        }
+    }
+    return (float)frameCount * 1000.0f / (now - lastFpsTime + 1);
 }
 
 void UpdatePhysics(float dt) {
     if (!showPhysics) return;
+    
+    RECT rc;
+    GetClientRect(hwndCanvas, &rc);
+    float right = (float)rc.right;
+    float bottom = (float)rc.bottom;
     
     for (int i = 0; i < objectCount; i++) {
         if (!objects[i].active) continue;
@@ -435,11 +598,6 @@ void UpdatePhysics(float dt) {
         objects[i].vy += gravity * dt;
         objects[i].x += objects[i].vx * dt;
         objects[i].y += objects[i].vy * dt;
-        
-        RECT rc;
-        GetClientRect(hwndCanvas, &rc);
-        float right = (float)rc.right;
-        float bottom = (float)rc.bottom;
         
         if (objects[i].shape == SHAPE_CIRCLE) {
             if (objects[i].x - objects[i].radius < 0) {
@@ -478,43 +636,74 @@ void UpdatePhysics(float dt) {
                 objects[i].vy *= -objects[i].restitution;
             }
         }
+    }
+    
+    BuildSpatialGrid();
+    
+    int cellsWide = spatialGrid.width > 0 ? (spatialGrid.width + GRID_CELL_SIZE - 1) / GRID_CELL_SIZE : 0;
+    
+    for (int i = 0; i < objectCount; i++) {
+        if (!objects[i].active) continue;
         
-        for (int j = i + 1; j < objectCount; j++) {
-            if (!objects[j].active) continue;
-            
-            float dx = objects[j].x - objects[i].x;
-            float dy = objects[j].y - objects[i].y;
-            float dist = sqrtf(dx * dx + dy * dy);
-            float minDist = 0;
-            
-            if (objects[i].shape == SHAPE_CIRCLE && objects[j].shape == SHAPE_CIRCLE) {
-                minDist = objects[i].radius + objects[j].radius;
-            } else {
-                minDist = (objects[i].width + objects[j].width) / 4;
-            }
-            
-            if (dist < minDist && dist > 0.01f) {
-                float overlap = minDist - dist;
-                float nx = dx / dist;
-                float ny = dy / dist;
+        int cellX = (int)(objects[i].x / GRID_CELL_SIZE);
+        int cellY = (int)(objects[i].y / GRID_CELL_SIZE);
+        
+        if (cellX < 0 || cellY < 0 || cellsWide <= 0) continue;
+        if (cellX >= cellsWide || cellY * cellsWide + cellX >= spatialGrid.cellCount) continue;
+        
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                int nx = cellX + dx;
+                int ny = cellY + dy;
                 
-                float totalMass = objects[i].mass + objects[j].mass;
-                objects[i].x -= nx * overlap * (objects[j].mass / totalMass);
-                objects[i].y -= ny * overlap * (objects[j].mass / totalMass);
-                objects[j].x += nx * overlap * (objects[i].mass / totalMass);
-                objects[j].y += ny * overlap * (objects[i].mass / totalMass);
+                if (nx < 0 || ny < 0 || nx >= cellsWide) continue;
+                int nIdx = ny * cellsWide + nx;
+                if (nIdx >= spatialGrid.cellCount) continue;
                 
-                float dvx = objects[i].vx - objects[j].vx;
-                float dvy = objects[i].vy - objects[j].vy;
-                float dvn = dvx * nx + dvy * ny;
-                
-                if (dvn > 0) {
-                    float restitution = (objects[i].restitution + objects[j].restitution) / 2;
-                    float impulse = (2 * dvn) / totalMass * restitution;
-                    objects[i].vx -= impulse * objects[j].mass * nx;
-                    objects[i].vy -= impulse * objects[j].mass * ny;
-                    objects[j].vx += impulse * objects[i].mass * nx;
-                    objects[j].vy += impulse * objects[i].mass * ny;
+                int j = spatialGrid.cells[nIdx];
+                while (j != -1) {
+                    if (j <= i || !objects[j].active) {
+                        j = (int)objects[j].mass;
+                        continue;
+                    }
+                    
+                    float cdx = objects[j].x - objects[i].x;
+                    float cdy = objects[j].y - objects[i].y;
+                    float cdist = sqrtf(cdx * cdx + cdy * cdy);
+                    float minDist = 0;
+                    
+                    if (objects[i].shape == SHAPE_CIRCLE && objects[j].shape == SHAPE_CIRCLE) {
+                        minDist = objects[i].radius + objects[j].radius;
+                    } else {
+                        minDist = (objects[i].width + objects[j].width) / 4;
+                    }
+                    
+                    if (cdist < minDist && cdist > 0.01f) {
+                        float overlap = minDist - cdist;
+                        float cnx = cdx / cdist;
+                        float cny = cdy / cdist;
+                        
+                        float totalMass = objects[i].mass + objects[j].mass;
+                        objects[i].x -= cnx * overlap * (objects[j].mass / totalMass);
+                        objects[i].y -= cny * overlap * (objects[j].mass / totalMass);
+                        objects[j].x += cnx * overlap * (objects[i].mass / totalMass);
+                        objects[j].y += cny * overlap * (objects[i].mass / totalMass);
+                        
+                        float dvx = objects[i].vx - objects[j].vx;
+                        float dvy = objects[i].vy - objects[j].vy;
+                        float dvn = dvx * cnx + dvy * cny;
+                        
+                        if (dvn > 0) {
+                            float restitution = (objects[i].restitution + objects[j].restitution) / 2;
+                            float impulse = (2 * dvn) / totalMass * restitution;
+                            objects[i].vx -= impulse * objects[j].mass * cnx;
+                            objects[i].vy -= impulse * objects[j].mass * cny;
+                            objects[j].vx += impulse * objects[i].mass * cnx;
+                            objects[j].vy += impulse * objects[i].mass * cny;
+                        }
+                    }
+                    
+                    j = (int)objects[j].mass;
                 }
             }
         }
@@ -529,6 +718,8 @@ void UpdatePhysics(float dt) {
         particles[i].life -= dt;
         if (particles[i].life <= 0) {
             particles[i].active = 0;
+            freeParticleList[freeParticleCount++] = i;
+            particleCount--;
             continue;
         }
         
@@ -541,6 +732,8 @@ void UpdatePhysics(float dt) {
         if (particles[i].x < 0 || particles[i].x > rc.right ||
             particles[i].y < 0 || particles[i].y > rc.bottom) {
             particles[i].active = 0;
+            freeParticleList[freeParticleCount++] = i;
+            particleCount--;
         }
     }
 }
@@ -549,8 +742,8 @@ void Render(HDC hdc) {
     for (int i = 0; i < objectCount; i++) {
         if (!objects[i].active) continue;
         
-        HBRUSH brush = CreateSolidBrush(objects[i].color);
-        HPEN pen = CreatePen(PS_SOLID, 1, objects[i].color);
+        HBRUSH brush = GetCachedBrush(objects[i].color);
+        HPEN pen = GetCachedPen(objects[i].color);
         SelectObject(hdc, brush);
         SelectObject(hdc, pen);
         
@@ -579,28 +772,27 @@ void Render(HDC hdc) {
             MoveToEx(hdc, (int)(objects[i].x - objects[i].width / 2), (int)objects[i].y, NULL);
             LineTo(hdc, (int)(objects[i].x + objects[i].width / 2), (int)objects[i].y);
         }
-        
-        DeleteObject(brush);
-        DeleteObject(pen);
     }
     
     for (int i = 0; i < particleCount; i++) {
         if (!particles[i].active) continue;
         
-        HBRUSH brush = CreateSolidBrush(particles[i].color);
+        HBRUSH brush = GetCachedBrush(particles[i].color);
         SelectObject(hdc, brush);
         Ellipse(hdc,
             (int)(particles[i].x - particles[i].size),
             (int)(particles[i].y - particles[i].size),
             (int)(particles[i].x + particles[i].size),
             (int)(particles[i].y + particles[i].size));
-        DeleteObject(brush);
     }
 }
 
 void SpawnParticles(float x, float y, int count) {
-    for (int i = 0; i < count && particleCount < MAX_PARTICLES; i++) {
-        Particle* p = &particles[particleCount++];
+    for (int i = 0; i < count; i++) {
+        if (freeParticleCount == 0) break;
+        
+        int idx = freeParticleList[--freeParticleCount];
+        Particle* p = &particles[idx];
         p->x = x;
         p->y = y;
         p->vx = ((float)rand() / RAND_MAX - 0.5f) * 200;
@@ -609,6 +801,7 @@ void SpawnParticles(float x, float y, int count) {
         p->color = currentColor;
         p->size = 3.0f + ((float)rand() / RAND_MAX) * 4.0f;
         p->active = 1;
+        particleCount++;
     }
 }
 
